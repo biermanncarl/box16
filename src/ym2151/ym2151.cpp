@@ -273,34 +273,86 @@ public:
 		m_previous_samples[1] = ym1;
 
 #elif defined(YM2151_USE_R8BRAIN_RESAMPLING)
-		// One challenge with this method of resampling is that the resampler does not necessarily
-		// return the number of samples that one would expect, given the number of input samples and
-		// the ratio of input vs. output sampling rate.
+		// (re)initialize resamplers if necessary
+		for (int i = 0; i < 2; ++i) {
+			if (!m_resampler[i] || (sample_rate != m_previous_sample_rate)) {
+				m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate);
+			}
+		}
+		m_previous_sample_rate = sample_rate;
+
+		// One challenge with this method of resampling is that the resampler lib does not necessarily
+		// return the desired number of samples.
 		// We therefore have to do the following things:
-		// * Re-use any left-over samples from last call.
-		// * Reasonably estimate how many input samples will be needed, given the number of already available output samples.
-		// * If the Resampler provided too few output samples, provide more input samples from the YM2151, until we have enough.
-		// * Store any access samples for re-use later on.
+		// * Re-use any potential left-over samples from last call.
+		// * Reasonably estimate how many input samples will be needed + plus a safety margin so that we don't have to re-do anything
+		// * in the (hopefully never occurring) case that the resampler provided too few samples, we extrapolate
+		// * Store any potentially occurring access samples for re-use later on.
 
+		int32_t samples_done[2]{0, 0};
+		int16_t *out_stream[2] {&buffers[0], &buffers[1]};
 
-		// uint32_t samples_needed = samples * m_chip_sample_rate / sample_rate;
-		// if (m_backbuffer_used < samples_needed) {
-		// 	pregenerate(samples_needed - m_backbuffer_used);
-		// }
+		// Use up any left-over (already resampled) samples from previous calls
+		for (int i = 0; i < 2; ++i) {
+			while ((!m_backbuffer_resampled[i].empty()) && (samples_done[i] < samples)) {
+				*out_stream[i] = m_backbuffer_resampled[i].front();
+				m_backbuffer_resampled[i].pop();
+				out_stream[i] += 2;
+				samples_done[i]++;
+			}
+		}
 
-		// uint32_t samples_used = 0;
+		if (samples_done[0] != samples_done[1]) {
+			printf("Warning: left and right audio channel received different amount of samples from YM2151!\n");
+		}
 
-		// r8b::CDSPResampler16 resampler[2]{
-		// 	r8b::CDSPResampler16(m_chip_sample_rate, sample_rate, m_chip_sample_rate),
-		// 	r8b::CDSPResampler16(m_chip_sample_rate, sample_rate, m_chip_sample_rate)
-		// };
+		// estimate how many samples we need to process
+		constexpr int32_t safety_margin = 1; // how many samples might the r8brain resampler leave out?
+		const int32_t output_samples_needed = samples - samples_done[0];
+		const int32_t orig_samples_needed = safety_margin + output_samples_needed * m_chip_sample_rate / sample_rate;
 
-		// how many original samples have been used
-		uint32_t samples_used = 0;
+		// get them from the YM2151
+		if (m_backbuffer_used < orig_samples_needed) {
+			pregenerate(orig_samples_needed - m_backbuffer_used);
+		}
 
-		uint32_t backbuffer_used_per_channel[2]{m_backbuffer_used, m_backbuffer_used};
+		// process them
 
 		for (int i = 0; i < 2; ++i) {
+			// // convert to double, as required by the resampling lib
+			// for (uint32_t s = 0; s < new_orig_samples; ++s) {
+			// 	m_resampling_input_buffer[s] = m_backbuffer[s + backbuffer_used_per_channel[i]].data[i];
+			// }
+
+			// // Do resampling
+			// double * resampler_output;
+			// int32_t resampled = m_resampler[i].value().process(m_resampling_input_buffer, orig_samples_needed, resampler_output);
+
+			// // Store samples in output buffer
+			// int32_t resampled_samples_used = 0;
+			// for (int32_t o = 0; (samples_done < samples) && (o < resampled); o++) {
+			// 	*out_stream = (int16_t)resampler_output[o];
+			// 	out_stream += 2;
+			// 	resampled_samples_used++;
+			// 	samples_done++;
+			// }
+
+			// // store any leftover resampled samples
+			// if (samples_done == samples) {
+			// 	for (int32_t o = resampled_samples_used; o < resampled; ++o) {
+			// 		m_backbuffer_resampled[i].push(*out_stream = (int16_t)resampler_output[o]);
+			// 	}
+			// }
+		}
+
+
+		/*
+		for (int i = 0; i < 2; ++i) {
+			// (re)initialize resampler if necessary
+			if (!m_resampler[i] || (sample_rate != m_previous_sample_rate)) {
+				m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate);
+			}
+
 			uint32_t samples_done = 0;
 			int16_t *out_stream = &buffers[i];
 
@@ -333,11 +385,6 @@ public:
 					m_resampling_input_buffer[s] = m_backbuffer[s + backbuffer_used_per_channel[i]].data[i];
 				}
 
-				// (re)initialize resampler if necessary
-				if (!m_resampler[i] || (sample_rate != m_previous_sample_rate)) {
-					m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate);
-				}
-
 				// Do resampling
 				double * resampler_output;
 				int32_t resampled = m_resampler[i].value().process(m_resampling_input_buffer, orig_samples_needed, resampler_output);
@@ -361,32 +408,11 @@ public:
 				backbuffer_used_per_channel[i] += new_orig_samples;
 				next_backbuffer_index = backbuffer_used_per_channel[i];
 			}
-
-			// double *input = static_cast<double *>(alloca(sizeof(double) * samples_needed));
-			// for (uint32_t s = 0; s < samples_needed; ++s) {
-			// 	input[s] = m_backbuffer[s].data[i];
-			// }
-
-			// int      out_needed = samples;
-			// // first consume any leftover samples from previous iteration
-			// if (out_needed)
-
-
-			// memset(input, 0, sizeof(double) * samples_needed);
-			// while (out_needed > 0) {
-			// 	out_written = resampler[i].process(input, samples_needed, output);
-			// 	out_written = std::min(out_written, out_needed);
-			// 	for (int o = 0; o < out_written; ++o) {
-			// 		*out_stream = (int16_t)output[o];
-			// 		out_stream += 2;
-			// 	}
-			// 	out_needed -= out_written;
-			// }
 		}
+		*/
 
-		m_previous_sample_rate = sample_rate;
-
-		samples_used = std::max(backbuffer_used_per_channel[0], backbuffer_used_per_channel[1]);
+		// how many original samples have been used
+		uint32_t samples_used = m_backbuffer_used;
 #endif
 
 		if (samples_used < m_backbuffer_used) {
