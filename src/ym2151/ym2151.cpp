@@ -1,5 +1,6 @@
 #include "ym2151.h"
 
+#include <optional>
 #include <queue>
 
 #include "ymfm_opm.h"
@@ -11,7 +12,7 @@
 
 //#define YM2151_USE_PICK 1
 //#define YM2151_USE_LINEAR_INTERPOLATION 1
-//#define YM2151_USE_R8BRAIN_RESAMPLING 1
+#define YM2151_USE_R8BRAIN_RESAMPLING 1
 
 #if !defined(YM2151_USE_PICK) && !defined(YM2151_USE_LINEAR_INTERPOLATION) && !defined(YM2151_USE_R8BRAIN_RESAMPLING)
 #	define YM2151_USE_LINEAR_INTERPOLATION 1
@@ -191,12 +192,15 @@ public:
 
 	void generate(int16_t *buffers, uint32_t samples, uint32_t sample_rate)
 	{
+
+#if defined(YM2151_USE_PICK) or defined(YM2151_USE_LINEAR_INTERPOLATION)
 		uint32_t samples_needed = samples * m_chip_sample_rate / sample_rate;
 		if (m_backbuffer_used < samples_needed) {
 			pregenerate(samples_needed - m_backbuffer_used);
 		}
 
 		uint32_t samples_used = 0;
+#endif
 
 #if defined(YM2151_USE_PICK)
 		auto     pick         = [&samples_used, this](ymfm::ym2151::output_data &ym) {
@@ -269,42 +273,120 @@ public:
 		m_previous_samples[1] = ym1;
 
 #elif defined(YM2151_USE_R8BRAIN_RESAMPLING)
-		r8b::CDSPResampler16 resampler[2]{
-			r8b::CDSPResampler16(m_chip_sample_rate, sample_rate, m_chip_sample_rate),
-			r8b::CDSPResampler16(m_chip_sample_rate, sample_rate, m_chip_sample_rate)
-		};
+		// One challenge with this method of resampling is that the resampler does not necessarily
+		// return the number of samples that one would expect, given the number of input samples and
+		// the ratio of input vs. output sampling rate.
+		// We therefore have to do the following things:
+		// * Re-use any left-over samples from last call.
+		// * Reasonably estimate how many input samples will be needed, given the number of already available output samples.
+		// * If the Resampler provided too few output samples, provide more input samples from the YM2151, until we have enough.
+		// * Store any access samples for re-use later on.
+
+
+		// uint32_t samples_needed = samples * m_chip_sample_rate / sample_rate;
+		// if (m_backbuffer_used < samples_needed) {
+		// 	pregenerate(samples_needed - m_backbuffer_used);
+		// }
+
+		// uint32_t samples_used = 0;
+
+		// r8b::CDSPResampler16 resampler[2]{
+		// 	r8b::CDSPResampler16(m_chip_sample_rate, sample_rate, m_chip_sample_rate),
+		// 	r8b::CDSPResampler16(m_chip_sample_rate, sample_rate, m_chip_sample_rate)
+		// };
+
+		// how many original samples have been used
+		uint32_t samples_used = 0;
+
+		uint32_t backbuffer_used_per_channel[2]{m_backbuffer_used, m_backbuffer_used};
 
 		for (int i = 0; i < 2; ++i) {
-			double *input = static_cast<double *>(alloca(sizeof(double) * samples_needed));
-			for (uint32_t s = 0; s < samples_needed; ++s) {
-				input[s] = m_backbuffer[s].data[i];
-			}
-
-			double * output;
+			uint32_t samples_done = 0;
 			int16_t *out_stream = &buffers[i];
-			int      out_needed = samples;
 
-			int out_written = resampler[i].process(input, samples_needed, output);
-			out_written     = std::min(out_written, out_needed);
-			for (int o = 0; o < out_written; ++o) {
-				*out_stream = (int16_t)output[o];
+			// Use up any left-over (already resampled) samples from previous calls
+			while ((!m_backbuffer_resampled[i].empty()) && (samples_done < samples)) {
+				*out_stream = m_backbuffer_resampled[i].front();
+				m_backbuffer_resampled[i].pop();
 				out_stream += 2;
+				samples_done++;
 			}
-			out_needed -= out_written;
 
-			memset(input, 0, sizeof(double) * samples_needed);
-			while (out_needed > 0) {
-				out_written = resampler[i].process(input, samples_needed, output);
-				out_written = std::min(out_written, out_needed);
-				for (int o = 0; o < out_written; ++o) {
-					*out_stream = (int16_t)output[o];
-					out_stream += 2;
+			uint32_t next_backbuffer_index = 0; // the position in the backbuffer, where we would continue reading bytes and sending them to the resampler
+
+			while (samples_done < samples) {
+				// estimate how many original samples will be needed
+				// the + sample_rate - 1 in the enumerator causes the division to "round up" instead of "round down".
+				// Perhaps add some extra samples here as a safety margin, so we don't have to go through this loop so often.
+				const uint32_t orig_samples_needed = ((samples - samples_done) * m_chip_sample_rate + sample_rate - 1) / sample_rate;
+
+				// generate the required amount of samples and store them in the backbuffer
+				const int32_t unused_orig_samples = backbuffer_used_per_channel[i] - next_backbuffer_index;
+				int32_t new_orig_samples = 0;
+				if (unused_orig_samples < orig_samples_needed) {
+					new_orig_samples = unused_orig_samples - orig_samples_needed;
+					pregenerate(new_orig_samples);
 				}
-				out_needed -= out_written;
+
+				// convert to double, as required by the resampling lib
+				for (uint32_t s = 0; s < new_orig_samples; ++s) {
+					m_resampling_input_buffer[s] = m_backbuffer[s + backbuffer_used_per_channel[i]].data[i];
+				}
+
+				// (re)initialize resampler if necessary
+				if (!m_resampler[i] || (sample_rate != m_previous_sample_rate)) {
+					m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate);
+				}
+
+				// Do resampling
+				double * resampler_output;
+				int32_t resampled = m_resampler[i].value().process(m_resampling_input_buffer, orig_samples_needed, resampler_output);
+
+				// Store samples in output buffer
+				int32_t resampled_samples_used = 0;
+				for (int32_t o = 0; (samples_done < samples) && (o < resampled); o++) {
+					*out_stream = (int16_t)resampler_output[o];
+					out_stream += 2;
+					resampled_samples_used++;
+					samples_done++;
+				}
+
+				// store any leftover resampled samples
+				if (samples_done == samples) {
+					for (int32_t o = resampled_samples_used; o < resampled; ++o) {
+						m_backbuffer_resampled[i].push(*out_stream = (int16_t)resampler_output[o]);
+					}
+				}
+
+				backbuffer_used_per_channel[i] += new_orig_samples;
+				next_backbuffer_index = backbuffer_used_per_channel[i];
 			}
+
+			// double *input = static_cast<double *>(alloca(sizeof(double) * samples_needed));
+			// for (uint32_t s = 0; s < samples_needed; ++s) {
+			// 	input[s] = m_backbuffer[s].data[i];
+			// }
+
+			// int      out_needed = samples;
+			// // first consume any leftover samples from previous iteration
+			// if (out_needed)
+
+
+			// memset(input, 0, sizeof(double) * samples_needed);
+			// while (out_needed > 0) {
+			// 	out_written = resampler[i].process(input, samples_needed, output);
+			// 	out_written = std::min(out_written, out_needed);
+			// 	for (int o = 0; o < out_written; ++o) {
+			// 		*out_stream = (int16_t)output[o];
+			// 		out_stream += 2;
+			// 	}
+			// 	out_needed -= out_written;
+			// }
 		}
 
-		samples_used = samples_needed;
+		m_previous_sample_rate = sample_rate;
+
+		samples_used = std::max(backbuffer_used_per_channel[0], backbuffer_used_per_channel[1]);
 #endif
 
 		if (samples_used < m_backbuffer_used) {
@@ -432,6 +514,14 @@ private:
 	int32_t m_busy_timer;
 
 	bool m_irq_status;
+
+#if defined(YM2151_USE_R8BRAIN_RESAMPLING)
+	std::optional<r8b::CDSPResampler16> m_resampler[2];
+	uint32_t m_previous_sample_rate{0};
+	// any samples that are generated in excess by the resamplers are stored in these queues for use in the next iteration.
+	std::queue<int16_t> m_backbuffer_resampled[2];
+	double m_resampling_input_buffer[YM_SAMPLE_RATE];
+#endif
 };
 
 static ym2151_interface Ym_interface;
