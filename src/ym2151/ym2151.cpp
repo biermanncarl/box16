@@ -285,8 +285,7 @@ public:
 		// return the desired number of samples.
 		// We therefore have to do the following things:
 		// * Re-use any potential left-over samples from last call.
-		// * Reasonably estimate how many input samples will be needed + plus a safety margin so that we don't have to re-do anything
-		// * in the (hopefully never occurring) case that the resampler provided too few samples, we extrapolate
+		// * Reasonably estimate how many input samples will be needed + plus a safety margin so that we hopefully get enough samples
 		// * Store any potentially occurring access samples for re-use later on.
 
 		int32_t samples_done[2]{0, 0};
@@ -319,97 +318,29 @@ public:
 		// process them
 
 		for (int i = 0; i < 2; ++i) {
-			// // convert to double, as required by the resampling lib
-			// for (uint32_t s = 0; s < new_orig_samples; ++s) {
-			// 	m_resampling_input_buffer[s] = m_backbuffer[s + backbuffer_used_per_channel[i]].data[i];
-			// }
+			// convert to double, as required by the resampling lib
+			for (uint32_t s = 0; s < orig_samples_needed; ++s) {
+				m_resampling_input_buffer[s] = m_backbuffer[s].data[i];
+			}
 
 			// // Do resampling
-			// double * resampler_output;
-			// int32_t resampled = m_resampler[i].value().process(m_resampling_input_buffer, orig_samples_needed, resampler_output);
+			double * resampler_output;
+			int32_t resampled = m_resampler[i].value().process(m_resampling_input_buffer, orig_samples_needed, resampler_output);
 
 			// // Store samples in output buffer
-			// int32_t resampled_samples_used = 0;
-			// for (int32_t o = 0; (samples_done < samples) && (o < resampled); o++) {
-			// 	*out_stream = (int16_t)resampler_output[o];
-			// 	out_stream += 2;
-			// 	resampled_samples_used++;
-			// 	samples_done++;
-			// }
-
-			// // store any leftover resampled samples
-			// if (samples_done == samples) {
-			// 	for (int32_t o = resampled_samples_used; o < resampled; ++o) {
-			// 		m_backbuffer_resampled[i].push(*out_stream = (int16_t)resampler_output[o]);
-			// 	}
-			// }
-		}
-
-
-		/*
-		for (int i = 0; i < 2; ++i) {
-			// (re)initialize resampler if necessary
-			if (!m_resampler[i] || (sample_rate != m_previous_sample_rate)) {
-				m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate);
+			int32_t resampled_samples_used = 0;
+			for (int32_t o = 0; (samples_done[i] < samples) && (o < resampled); o++) {
+				*out_stream[i] = (int16_t)resampler_output[o];
+				out_stream[i] += 2;
+				resampled_samples_used++;
+				samples_done[i]++;
 			}
 
-			uint32_t samples_done = 0;
-			int16_t *out_stream = &buffers[i];
-
-			// Use up any left-over (already resampled) samples from previous calls
-			while ((!m_backbuffer_resampled[i].empty()) && (samples_done < samples)) {
-				*out_stream = m_backbuffer_resampled[i].front();
-				m_backbuffer_resampled[i].pop();
-				out_stream += 2;
-				samples_done++;
-			}
-
-			uint32_t next_backbuffer_index = 0; // the position in the backbuffer, where we would continue reading bytes and sending them to the resampler
-
-			while (samples_done < samples) {
-				// estimate how many original samples will be needed
-				// the + sample_rate - 1 in the enumerator causes the division to "round up" instead of "round down".
-				// Perhaps add some extra samples here as a safety margin, so we don't have to go through this loop so often.
-				const uint32_t orig_samples_needed = ((samples - samples_done) * m_chip_sample_rate + sample_rate - 1) / sample_rate;
-
-				// generate the required amount of samples and store them in the backbuffer
-				const int32_t unused_orig_samples = backbuffer_used_per_channel[i] - next_backbuffer_index;
-				int32_t new_orig_samples = 0;
-				if (unused_orig_samples < orig_samples_needed) {
-					new_orig_samples = unused_orig_samples - orig_samples_needed;
-					pregenerate(new_orig_samples);
-				}
-
-				// convert to double, as required by the resampling lib
-				for (uint32_t s = 0; s < new_orig_samples; ++s) {
-					m_resampling_input_buffer[s] = m_backbuffer[s + backbuffer_used_per_channel[i]].data[i];
-				}
-
-				// Do resampling
-				double * resampler_output;
-				int32_t resampled = m_resampler[i].value().process(m_resampling_input_buffer, orig_samples_needed, resampler_output);
-
-				// Store samples in output buffer
-				int32_t resampled_samples_used = 0;
-				for (int32_t o = 0; (samples_done < samples) && (o < resampled); o++) {
-					*out_stream = (int16_t)resampler_output[o];
-					out_stream += 2;
-					resampled_samples_used++;
-					samples_done++;
-				}
-
-				// store any leftover resampled samples
-				if (samples_done == samples) {
-					for (int32_t o = resampled_samples_used; o < resampled; ++o) {
-						m_backbuffer_resampled[i].push(*out_stream = (int16_t)resampler_output[o]);
-					}
-				}
-
-				backbuffer_used_per_channel[i] += new_orig_samples;
-				next_backbuffer_index = backbuffer_used_per_channel[i];
+			// store any leftover resampled samples
+			for (int32_t o = resampled_samples_used; o < resampled; ++o) {
+				m_backbuffer_resampled[i].push((int16_t)resampler_output[o]);
 			}
 		}
-		*/
 
 		// how many original samples have been used
 		uint32_t samples_used = m_backbuffer_used;
