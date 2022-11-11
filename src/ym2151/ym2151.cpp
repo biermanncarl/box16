@@ -276,7 +276,8 @@ public:
 		// (re)initialize resamplers if necessary
 		for (int i = 0; i < 2; ++i) {
 			if (!m_resampler[i] || (sample_rate != m_previous_sample_rate)) {
-				m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate);
+				//m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate, 5.f);
+				m_resampler[i].emplace(m_chip_sample_rate, sample_rate, m_chip_sample_rate, 25.f, 35.0, r8b::fprLinearPhase);
 			}
 		}
 		m_previous_sample_rate = sample_rate;
@@ -473,7 +474,8 @@ private:
 	bool m_irq_status;
 
 #if defined(YM2151_USE_R8BRAIN_RESAMPLING)
-	std::optional<r8b::CDSPResampler16> m_resampler[2];
+	// std::optional<r8b::CDSPResampler16> m_resampler[2];
+	std::optional<r8b::CDSPResampler> m_resampler[2];
 	uint32_t m_previous_sample_rate{0};
 	// any samples that are generated in excess by the resamplers are stored in these queues for use in the next iteration.
 	std::queue<int16_t> m_backbuffer_resampled[2];
